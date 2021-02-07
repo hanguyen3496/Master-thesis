@@ -1,0 +1,399 @@
+---
+title: "NYC Neighbourhood Exploratory Analysis"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(rgeos)
+library(sp)
+library(rgdal)
+library(diverse)
+#install.packages("wesanderson")
+library(wesanderson)
+library(ggrepel)
+library(sf)
+library(ggpubr)
+
+
+#Fetching the data frm Airbnb data and ACS data
+
+getwd
+
+setwd("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Airbnb Data")
+
+listings <- read.csv("listings.csv.gz")
+listings <- listings %>%
+  filter(!room_type=="Entire home/apt" )
+
+View(listings)
+
+calendar <- read.csv("calendar.csv.gz")
+View(calendar)
+
+setwd("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Neighborhood Clustering/Socio-economic data")
+econ <- read.csv("Econ.csv")
+demo <- read.csv("Demo.csv")
+socio <- read.csv("Socio.csv")
+hous <- read.csv("Hous.csv")
+area <- read.csv("area.csv")
+```
+
+```{r}
+#Tranform the variables in Airbnb listings
+
+listings <- listings %>%
+  mutate(price= as.numeric(gsub(",","",substring(price, 2))),
+         cleaning_fee= as.numeric(gsub(",","",substring(cleaning_fee, 2))),
+         extra_people= as.numeric(gsub(",","",substring(extra_people, 2))),
+         security_deposit= as.numeric(gsub(",","",substring(security_deposit, 2))))%>%
+  replace(is.na(.),0)%>%
+  mutate(guests_included=ifelse(guests_included > accommodates,accommodates,guests_included),
+         net_price=(price+cleaning_fee)/guests_included)
+
+
+#Select the variables
+
+econ1 <- econ %>%
+  dplyr::select(GeoType,GeogName,GeoID,Borough,HHIU10E,HHI10t14E,HHI15t24E,HHI25t34E,HHI35t49E,HHI50t74E,HHI75t99E,HI100t149E,HI150t199E,HHI200plE,CvEm16pl3E,ArtEnRAFSE,CvLF2E,CvLFUEm2E,FamPvUE,FamBwPvE,MdFamIncE)
+view(econ1)
+
+demo1 <- demo %>%
+  dplyr::select(GeoType,GeogName,GeoID,Borough,Hsp1E,WtNHE,BlNHE,AIANNHE,AsnNHE,NHPINHE,Pop20t24E,Pop25t29E,Pop30t34E,Pop_1E)
+
+socio1 <- socio %>%
+  dplyr::select(GeoType,GeogName,GeoID,Borough,EA_P25plE,EA_BchDE,EA_GrdPfDE)
+
+hous1 <- hous %>%
+  dplyr::select(GeoType,GeogName,GeoID,Borough,MdVlE)
+view(hous1)
+
+#Join all socio-economic variables into one data tabel
+join <- inner_join(econ1,demo1,by=c("GeoType","GeogName","GeoID","Borough"))
+join1 <- inner_join(join,socio1,by=c("GeoType","GeogName","GeoID","Borough"))
+join2 <- inner_join(join1,hous1,by=c("GeoType","GeogName","GeoID","Borough"))
+join3 <- inner_join(join2,area,by=c("GeoID"))
+
+join4 <- join3 %>%
+  mutate_at(c("HHIU10E","HHI10t14E","HHI15t24E","HHI25t34E","HHI35t49E","HHI50t74E","HHI75t99E","HI100t149E","HI150t199E","HHI200plE","CvEm16pl3E","ArtEnRAFSE","CvLF2E","CvLFUEm2E","FamPvUE","FamBwPvE","MdFamIncE","Hsp1E","WtNHE","BlNHE","AIANNHE","AsnNHE","NHPINHE","Pop20t24E","Pop25t29E","Pop30t34E","Pop_1E","EA_P25plE","EA_BchDE","EA_GrdPfDE","MdVlE"
+  ),as.numeric) %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>%
+  arrange(-desc(GeoID))
+
+join4
+contains.missng <- join3 %>%
+  filter_all(any_vars(is.na(.))) %>%
+  select_if(function(x) any(is.na(x)))
+
+view(contains.missng)
+```
+
+```{r}
+#Calculate Race Diversity Index (Hispanic/Latino (of any race),Not Hispanic/Latino,White alone,Black or African American alone,American Indian and Alaska Native alone,Asian alone,Native Hawaiian and Other Pacific Islander alone)
+aaa <-  join4 %>%
+  dplyr::select(GeoID,Hsp1E,WtNHE,BlNHE,AIANNHE,AsnNHE,NHPINHE)%>%
+  gather(key = "type", value = "value", -GeoID) %>%
+  mutate(type=as.factor(type),
+         value=as.numeric(value))
+
+race_div <- diversity(aaa, type = 'gini-simpson', category_row = FALSE )
+race_div
+
+join4
+
+join4 %>% dplyr::select(GeoID,Hsp1E,WtNHE,BlNHE,AIANNHE,AsnNHE,NHPINHE)%>% filter(GeoID==c("BK21"))
+
+join4 %>% dplyr::select(GeoID,Hsp1E,WtNHE,BlNHE,AIANNHE,AsnNHE,NHPINHE)%>% filter(GeoID==c("SI54"))
+
+#Calculate Income Diversity Index (low income (annual incomes less than $35,000), middle band income (annual incomes between $35,000 and $100,000) and high income (annual incomes greater than $100,000))
+
+bbb <- join4 %>%
+  dplyr::select(GeoID,HHIU10E,HHI10t14E,HHI15t24E,HHI25t34E,HHI35t49E,HHI50t74E,HHI75t99E,HI100t149E,HI150t199E,HHI200plE)%>%
+  mutate(low_income=HHIU10E+HHI10t14E+HHI15t24E+HHI25t34E,
+         mid_income=HHI35t49E+HHI50t74E+HHI75t99E,
+         high_income=HI100t149E+HI150t199E+HHI200plE)%>%
+  dplyr::select(!c("HHIU10E","HHI10t14E","HHI15t24E","HHI25t34E","HHI35t49E","HHI50t74E","HHI75t99E","HI100t149E","HI150t199E","HHI200plE"
+  ))%>%
+  gather(key = "type", value = "value", -GeoID)
+
+bbb
+
+income_div <- diversity(bbb, type = 'gini-simpson', category_row = FALSE )
+income_div
+
+##Calculate and Include all features
+
+nyc <- join4 %>%
+  mutate(race_div=race_div$gini.simpson,
+         income_div=income_div$gini.simpson,
+         bohemian=ArtEnRAFSE/CvEm16pl3E,
+         talent=(EA_BchDE+EA_GrdPfDE)/EA_P25plE,
+         young=(Pop20t24E+Pop25t29E+Pop30t34E)/Pop_1E,
+         unemployment=CvLFUEm2E/CvLF2E,
+         poverty=FamBwPvE/FamPvUE,
+         income=MdFamIncE,
+         household_value=MdVlE,
+         popDens=Pop_1E/Area) %>%
+  dplyr::select(!c("HHIU10E","HHI10t14E","HHI15t24E","HHI25t34E","HHI35t49E","HHI50t74E","HHI75t99E","HI100t149E","HI150t199E","HHI200plE","CvEm16pl3E","ArtEnRAFSE","CvLF2E","CvLFUEm2E","FamPvUE","FamBwPvE","MdFamIncE","Hsp1E","WtNHE","BlNHE","AIANNHE","AsnNHE","NHPINHE","Pop20t24E","Pop25t29E","Pop30t34E","Pop_1E","EA_P25plE","EA_BchDE","EA_GrdPfDE","MdVlE","Area"
+  ))
+
+##Join distance
+##DISTANCE FROM CITY CENTER (Central Park)
+
+library(raster)
+wa.map <- readOGR(dsn='C:/Users/Ha Nguyen/Desktop/Thesis/Data/NTA Coordinates/nynta_20c',layer="nynta")
+nyc_map <- spTransform(wa.map, CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0 "))
+
+coords <- coordinates(nyc_map)
+nyc_dist <- as.data.frame(nyc_map) 
+
+nyc_dist[,c("X","Y")] <- coords
+nyc_dist[,"distance"] <- pointDistance(coords,c(-73.9665,40.7812),lonlat=TRUE,type="Greatcircle")
+
+nyc_dist <- nyc_dist[,c("NTACode","distance")]
+colnames(nyc_dist)[1] <- "GeoID"
+
+##Join distance
+
+nyc <- nyc %>%
+  left_join(nyc_dist,by="GeoID")
+
+##Filter NA value in NYC
+nyc <- nyc %>%
+  filter_all(all_vars(!is.na(.)))
+
+```
+ 
+```{r}
+#NEIGHBORHOOD CLUSTERING
+
+#Scale the data
+nyc_scaled <- nyc %>%
+  dplyr::select(!c("GeoType","GeogName","GeoID","Borough")) %>%
+  scale()
+
+nyc_scaled
+
+
+# Run the fviz_nbclust function with our selected data and method "wss"
+#install.packages("factoextra")
+library(factoextra)
+elbow_method <- fviz_nbclust(nyc_scaled,kmeans,method="wss")
+
+# View the plot
+elbow_method    
+
+# Run the fviz_nbclust function with the method "silhouette" 
+silhouette_method <- fviz_nbclust(nyc_scaled,kmeans,method="silhouette")
+
+# View the plot
+silhouette_method
+
+# Run the k-means algorithm 
+set.seed(3496)
+k_means <- kmeans(nyc_scaled,centers=3,iter.max=15,nstart=25)
+nyc_labeled <- nyc %>%
+  mutate(clusters = k_means$cluster)
+
+head(nyc_labeled)
+
+write.csv(nyc_labeled,"cluster.csv")
+
+# Group by the cluster assignment and calculate averages
+nyc_clus_avg <- nyc_labeled %>%
+  group_by(clusters) %>%
+  summarize_if(is.numeric,mean)
+
+# View the resulting table
+nyc_clus_avg 
+```
+
+
+```{r}
+###View NYC map after clustering
+
+library(data.table)
+library(plyr)
+
+nyc_labeled_map <- nyc_labeled[,c("GeoID","clusters")]
+nyc_labeled_map <- nyc_labeled_map %>% mutate(clusters=as.factor(clusters))
+
+nyc_map@data$id = rownames(nyc_map@data)
+nyc_map.points = fortify(nyc_map, region = "id")
+nyc_map.df = join(nyc_map.points, nyc_map@data, by = "id")
+nyc_map.df = subset(nyc_map.df, select = c(long, lat, group, NTACode))
+names(nyc_map.df) = c("long", "lat", "group", "GeoID")
+
+full.data = join(nyc_labeled_map, nyc_map.df, by = "GeoID", type = "full")
+
+full.data %>%
+  ggplot(aes(x = long , y = lat,group=group, fill = clusters)) + geom_polygon() #maps of NYC with neighborhood cluster
+
+
+##Links Neighborhood in Airbnb listings data to NTAcode, to link cluster later
+
+dat <- data.frame(Longitude = listings[,"longitude"],
+                  Latitude =listings[,"latitude"])
+# Assignment modified according
+coordinates(dat) <- ~ Longitude + Latitude
+# Set the projection of the SpatialPointsDataFrame using the projection of the shapefile
+proj4string(dat) <- proj4string(nyc_map)
+
+GeoID <- sp::over(dat, nyc_map)
+
+listings[,"GeoID"] <- GeoID[4]
+
+listings <- listings %>% inner_join(nyc_labeled[,c("GeoID","clusters")],by="GeoID") %>% ungroup()
+
+#######Plotting 
+
+###clustering and neighborhood area
+
+wa.boro <- readOGR(dsn='C:/Users/Ha Nguyen/Desktop/Thesis/Data/Borough Boundaries',layer="geo_export_19878bcd-a9b3-4eb4-8688-957f886c756b")
+nyc_boro <- spTransform(wa.boro, CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0 "))
+
+
+nc <- st_read('C:/Users/Ha Nguyen/Desktop/Thesis/Data/Borough Boundaries',layer="geo_export_19878bcd-a9b3-4eb4-8688-957f886c756b")
+
+nc[,c("long","lat")] <- coordinates(nyc_boro)
+
+
+g2 <- ggplot(full.data,
+       aes(x = long , y = lat,group=group, fill = clusters)) +
+  geom_polygon(color="black") +
+  scale_fill_manual(values = wes_palette("Moonrise3", n = 4), 
+                    labels = c("1", "2", "3","Null"), 
+                    name = "Clusters") + 
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("NYC Neighbourhood Clustering based on Socioeconomics",subtitle = "Map showing Neighorhood Clusters")+
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())#maps of NYC with neighborhood cluster
+
+ggarrange(g1, g2, ncol = 2, nrow = 2)
+
+##neighborhood and price
+
+names(listings)
+write.csv(listings,"check.csv")
+
+detach(package:plyr)
+avgPrice <- listings  %>%group_by(GeoID) %>% dplyr::summarise(avg_price = mean(net_price, na.rm = TRUE))
+avgRating <- listings %>% group_by(GeoID) %>% dplyr::summarise(avg_rating = mean(review_scores_location, na.rm = TRUE))
+toListing <- listings %>% group_by(GeoID) %>% count()
+toRev <- listings  %>%  group_by(GeoID) %>% dplyr::summarise(total_reviews = sum(number_of_reviews, na.rm = TRUE))
+
+library(plyr)
+price.data = join(avgPrice, nyc_map.df, by = "GeoID", type = "full")
+rating.data = join(avgRating, nyc_map.df, by = "GeoID", type = "full")
+toListings.data = join(toListing, nyc_map.df, by = "GeoID", type = "full")
+toRev.data = join(toRev, nyc_map.df, by = "GeoID", type = "full")
+
+#Listing numbers in each cluster
+listings %>%
+  group_by(clusters.x) %>%
+  dplyr::count()
+
+
+
+#Which area is more expensive?
+ggplot(price.data,aes(x = long , y = lat,group=group, fill=avg_price)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area is the most expensive?",
+          subtitle = "Map showing Average Price per Person by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Avg.Price per Person", type = "div", palette = "YlOrBr",values = scales::rescale((1:10)^2, c(0,1)),
+                       direction = 1, labels = scales::comma_format()) +
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+
+#Which area has the most reviews?
+ggplot(toRev.data,aes(x = long , y = lat,group=group, fill=total_reviews)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area has the most reviews?",
+          subtitle = "Map showing Total Reviews by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Total reviews", type = "div", palette = "YlOrBr",values = scales::rescale((1:10)^2, c(0,1)),
+                       direction = 1, labels = scales::comma_format()) +
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+
+
+#scale_fill_distiller("Average Price", type = "div", palette = "Spectral",values = scales::rescale((1:10)^2, c(0,1)),direction = 1, labels = scales::comma_format()) +
+#scale_fill_gradientn(colors = c( "yellow","orange", "red"), breaks=c(0,50,100,150,200,250,300,350,400,Inf), guide = "colorbar")
+
+
+# Which locations have better ratings?
+ggplot(rating.data,aes(x = long , y = lat,group=group, fill=avg_rating)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area is the best?",
+          subtitle = "Map showing Average Location Score by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Location Review Score", type = "div", palette = "Spectral",values = scales::rescale((1:10)^0.1, c(0,1)),
+                       direction = -1, labels = scales::comma_format())+
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+
+##neighborhood and number of listings
+ggplot(toListings.data,aes(x = long , y = lat,group=group, fill=n)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area has most listings?",
+          subtitle = "Map showing Total Listings by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Total Listings", type = "div", palette = "Spectral",values = scales::rescale((1:10)^3, c(0,1)),
+                       direction = -1, labels = scales::comma_format())+
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+```
+
