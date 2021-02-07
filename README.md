@@ -1,4 +1,4 @@
-# Master-thesis
+# Master-thesis-on-Airnb
 **Thesis goal: empirical insights mining from a large dataset of Airbnb listings that compete in the same market segments with traditional 2-start hotels in New York City (NYC)**
 
 1. The first part focused on analyzing the current pattern of the NYC lodging market and the spatial distribution of Airbnb listings. An exploratory analysis of the Airbnb listings dataset and clustering algorithm performed on socio-economic data to address the following questions:
