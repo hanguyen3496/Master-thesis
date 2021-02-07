@@ -1,0 +1,224 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(RColorBrewer)
+library(wordcloud)
+library(ggrepel)
+library(syuzhet)
+```
+
+
+```{r}
+
+word_clouds <- congress_tokens_lite %>%
+  # get count of each token in each document
+  group_by(word) %>%
+  count(word)
+
+##Create Wordcloud
+
+set.seed(1234) # for reproducibility 
+wordcloud(words = word_clouds$word, freq = word_clouds$n, min.freq = 1, max.words=200, random.order=FALSE, rot.per=0.35,            colors=brewer.pal(8, "Dark2"))
+
+
+####Sentiment Analysis: General Sentiment
+
+reviews.topic <- read.csv("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Airbnb Data/reviews.topic.csv")
+
+
+# regular sentiment score using get_sentiment() function and method of your choice
+# please note that different methods may have different scales
+syuzhet_vector <- get_sentiment(unlist(reviews.topic$text), method="syuzhet")
+# see the first row of the vector
+
+as.data.frame(syuzhet_vector)%>%
+  mutate(sen=ifelse(syuzhet_vector>0,"positive",
+                    ifelse(syuzhet_vector<0,"negative","neutral")))%>%
+  group_by(sen)%>%
+  count(sen)%>%
+  ungroup() %>%
+  arrange(desc(-n)) %>%
+  
+# Basic piechart
+  ggplot(aes(x=sen, y=n, fill=sen)) + 
+  geom_bar(position = 'dodge', stat='identity') +
+  geom_text(aes(label=n), position=position_dodge(width=0.9), vjust=-0.25)+
+  scale_fill_brewer(palette="YlOrRd",direction=-1) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "General Reviews Sentiment Analysis")+
+  theme_classic() + theme(axis.line = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          plot.title = element_text(hjust = 0.5))+
+  theme(legend.position="bottom")
+
+##Sentiment Polarity per Tokenized Words
+
+word_vector <- get_sentiment(unlist(word_clouds$word), method="syuzhet")
+word_clouds[,"polarity"] <- word_vector
+
+
+ap_sentiments <- word_clouds %>%
+  mutate(sentiment=ifelse(polarity >0,"positive",
+                          ifelse(polarity < 0, "negative","neutral"))) %>%
+  filter(!sentiment=="neutral") %>%
+  group_by(sentiment)%>%
+  arrange(desc(n))%>%
+  top_n(20,n) %>%
+  mutate(n = ifelse(sentiment == "negative", -n, n)) %>%
+  mutate(term = reorder(word, n)) %>%
+  ggplot(aes(term, n, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Top 20 Words Contribution to Sentiment")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+
+ap_sentiments
+
+#Aspect based Sentiment Analysis
+
+result <-get_nrc_sentiment(unlist(reviews.topic$text))
+
+result[,c("doc_id","sentence_id","topic","text")] <- reviews.topic[,c("doc_id","sentence_id","topic","text")]
+result[,c("sentiment_score")] <- syuzhet_vector
+
+#Polarity sentiment in each aspect
+
+result %>%
+  mutate(polarity=ifelse(sentiment_score >0 ,"positive",
+                         ifelse(sentiment_score <0, "negative","neutral"))) %>%
+  filter(!polarity=="neutral")%>%
+  group_by(polarity,topic) %>%
+  count()%>%
+  mutate(n = ifelse(polarity == "negative", -n, n)) %>%
+  ggplot(aes(topic, n, fill = polarity)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Sentiment Polarity over Aspects")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+
+#Summary of 8 sentiments in each aspect
+result %>%
+  select(!c("positive","negative","doc_id","sentence_id","sentiment_score")) %>%
+  group_by(topic)%>%
+  summarise_if(is.numeric,sum) %>%
+  ungroup() %>%
+  gather("sentiment","value",-topic)%>%
+  group_by(topic) %>%
+  ggplot(aes(sentiment, value, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~topic) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Emotion Levels of the Lodging Aspects")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+result1 <- result %>%
+  select(!c("positive","negative","doc_id","sentence_id","sentiment_score")) %>%
+  group_by(topic)%>%
+  summarise_if(is.numeric,sum) %>%
+  ungroup() %>%
+  gather("sentiment","value",-topic)%>%
+  group_by(topic) %>%
+  mutate(per=value*100/sum(value)) %>%
+  arrange(desc(topic)) %>%
+  select(!value) %>%
+  spread(sentiment,per)
+
+
+
+##Find the top issues in each aspect-sentiment 
+
+
+result$sentence_id <- as.character(result$sentence_id)
+
+result2 <- result %>%
+  left_join(x1[,c("sentence_id","sentence","word")],by="sentence_id")
+
+result2 %>%
+  select(trust,topic,sentence) %>%
+  filter(trust>1) %>%
+  unnest_tokens(word,sentence,token = "words") %>%
+  anti_join(stop_words) %>%
+  mutate(word=wordStem(word)) %>%
+  count(topic,word) %>%
+  arrange(desc(topic),desc(n))%>%
+  group_by(topic)%>%
+  top_n(10)
+  
+
+x2 <- x1 %>%
+  unnest_tokens(word,sentence,token = "words")
+
+word_sen <-get_nrc_sentiment(unlist(x2$word))
+
+x3 <- cbind(x2,word_sen)
+
+x3 %>%
+  select(word,topic,anger) %>%
+  filter(anger >0) %>%
+  group_by(topic,word)%>%
+  count() %>%
+  arrange(desc(topic),desc(n)) %>%
+  group_by(topic)%>%
+  top_n(5,n)
+
+x3 %>%
+  select(word,topic,disgust) %>%
+  filter(disgust >0) %>%
+  group_by(topic,word)%>%
+  count() %>%
+  arrange(desc(topic),desc(n)) %>%
+  group_by(topic)%>%
+  top_n(10,n)
+
+x3 %>%
+  select(word,topic,anticipation) %>%
+  filter(anticipation >0) %>%
+  group_by(topic,word)%>%
+  count() %>%
+  arrange(desc(topic),desc(n)) %>%
+  group_by(topic)%>%
+  top_n(10,n)
+
+
+TextDoc_dtm <- TermDocumentMatrix(reviews.corpus.clean)
+findAssocs(TextDoc_dtm, terms = c("money","fee"), corlimit = 0.05)			
+
+
+
+```
+
+```{r}
+### Maps of all targeted reviews with clusters
+
+#Which area is more expensive?
+ggplot(price.data,aes(x = long , y = lat,group=group, fill=avg_price)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area is the most expensive?",
+          subtitle = "Map showing Average Price by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Average Price", type = "div", palette = "Spectral",values = scales::rescale((1:10)^2, c(0,1)),
+                       direction = 1, labels = scales::comma_format()) +
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+  
+```
+
+

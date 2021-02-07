@@ -1,0 +1,140 @@
+---
+title: "Reviews Analysis"
+output: html_document
+---
+
+```{r}
+#install.packages("textcat"): language detection
+library("textcat")
+#install.packages("tm")
+library("tm")
+#install.packages("SnowballC")
+library(SnowballC)
+#install.packages("topicmodels")
+library(topicmodels)
+library(slam)
+#install.packages("tidytext")
+library(tidytext)
+```
+
+
+
+```{r}
+
+reviews1 <- reviews %>%
+  dplyr::select(id,comments)
+
+colnames(reviews1) <- c("doc_id", "text")
+
+reviews1 <- sample_n(reviews1,50000,replace=FALSE) %>%
+  mutate(language=textcat(text)) 
+
+reviews1 <- reviews1 %>%
+  filter(language =="english") %>%
+  select(!language)
+
+reviews.sen <- unnest_tokens(reviews1,output=sentence,input=text,token="sentences") %>%
+    mutate(sentence_id=row_number())
+  
+reviews.sen1 <- reviews.sen %>%
+  relocate(sentence_id, .after = doc_id) %>%
+    select(!doc_id)
+
+colnames(reviews.sen1) <- c("doc_id", "text")
+
+reviews.corpus <- VCorpus(DataframeSource(reviews.sen1))
+
+
+#transaformation of the corpora
+reviews.corpus.clean <- tm_map(reviews.corpus, content_transformer(tolower)) 
+reviews.corpus.clean <- tm_map(reviews.corpus.clean,stripWhitespace)
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removePunctuation)
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeNumbers)
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeWords, stopwords("english"))
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, stemDocument, language="english") 
+reviews.corpus.clean <- tm_map(reviews.corpus.clean,PlainTextDocument,lazy=TRUE)
+
+
+####Custom remove words
+
+
+custom.stopword <- c("peopl","effort","fault", #generic nouns
+                     "newyork","new york","brooklyn","manhattan","nyc",
+                     "stay","great","host","help","realli","time","nice","apart","place",
+                     "thank","easi","just","clean","need","want","like","love","get","definit","love","also",
+                     "even","well","good","perfect","york","check","much","look","will","one","back","make","around","made","super",
+                    "subway","night","lot","high","area","comfort","close","walk","everyth","citi","away","enjoy","feel","let","live","amaz","day","minut","earli","leav",
+                    "provid","welcom","hous","wonder","can","quite","come","airbnb","home","alway","visit","gave","felt","arriv","take","first","exact"
+                    )
+
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeWords, custom.stopword)
+
+#Create DTM
+
+review.dtm <- DocumentTermMatrix(reviews.corpus.clean, 
+                                 control = list(weighting = weightTf))
+
+
+
+### Remove the sparse reviews
+
+review.dtm <- removeSparseTerms(review.dtm, 0.999)
+#review.id <- review.dtm$id[row_sums(review.dtm) > 0]
+review.dtm <- review.dtm[row_sums(review.dtm) > 0,]
+
+
+#removeCommonTerms function
+
+removeCommonTerms <- function (x, pct) 
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")), 
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix")) 
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix")) 
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+review.dtm <- 
+  removeCommonTerms(review.dtm ,.8)
+
+```
+
+```{r}
+#####Topic modellings
+mod_log_lik = numeric(9)
+mod_perplexity = numeric(9)
+
+for (i in 2:10) { mod = LDA(review.dtm, k=i, method="Gibbs",             
+                            control=list(alpha=0.5, iter=10, seed=12345, thin=1))
+                  mod_log_lik[i] = logLik(mod)  
+                  mod_perplexity[i] = perplexity(mod, review.dtm)}
+
+# Specify the possible values of k and build the plot
+k <- 2:10
+plot(x=k, y=mod_perplexity[2:10], xlab="number of clusters, k", 
+     ylab="perplexity score", type="o")
+plot(x=k, y=mod_log_lik[2:10], xlab="number of clusters, k", 
+     ylab="log-likelihood score", type="o")
+
+lda_mod <- LDA(x=review.dtm, k=5, method="Gibbs",
+               control=list(alpha=0.5, iter=10, seed=12345, thin=1))
+
+tidy(lda_mod)%>%
+  arrange(desc(beta))
+
+
+tidy(lda_mod, matrix="beta") %>%
+  group_by(topic) %>%
+  
+
+```
+
+```{python}
+
+```
+

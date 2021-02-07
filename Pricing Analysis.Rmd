@@ -1,0 +1,696 @@
+---
+title: "Untitled"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(VIM)
+library(mice)
+#install.packages("ade4")
+library(ade4)
+library(factoextra)
+library(raster)
+library(ggplot2)
+library(FactoMineR)
+library(arsenal)
+library(chron)
+```
+
+```{r}
+getwd
+
+setwd("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Airbnb Data")
+holiday <- read.csv("NYC Holiday.csv")
+review <- read.csv("reviews.csv.gz")
+calendar20 <- read.csv("calendar.2020.csv.gz")
+calendar19 <- read.csv("calendar.2019.csv.gz")
+listings <- read.csv("listings.csv.gz",na.strings=c("","NA"))
+
+calendar = bind_rows(calendar20,calendar19)
+
+review.count <- review %>%
+  dplyr::select(listing_id,date,comments) %>%
+  mutate(date=as.Date(date)) %>%
+  filter(date > "2018-12-31") %>%
+  filter(!str_detect(comments, pattern = "The host canceled this reservation")) %>%
+  filter(!str_detect(comments, pattern = "The reservation was canceled")) %>%
+  filter(!str_detect(comments, pattern = "The host canceled my reservation")) %>%
+  group_by(listing_id,date)%>%
+  count(listing_id,date)
+
+unique(listings$calculated_host_listings_count)
+
+```
+
+```{r}
+#### Target group of 2-start local hotels: private/shared room. 
+listings.clust <- listings %>%
+  filter(!room_type == "Entire home/apt" & !room_type == "Hotel room") %>%
+  dplyr::select(id,amenities,host_response_rate,host_acceptance_rate,host_is_superhost,longitude,latitude,property_type,room_type,bathrooms,bedrooms,bed_type,beds,number_of_reviews,review_scores_rating,price,weekly_price,monthly_price,cleaning_fee,guests_included,extra_people,security_deposit,cancellation_policy,instant_bookable,accommodates, minimum_nights,neighbourhood_group_cleansed,availability_365,require_guest_profile_picture,require_guest_phone_verification,calculated_host_listings_count) %>%
+  mutate(price= as.numeric(gsub(",","",substring(price, 2))),
+         weekly_price= as.numeric(gsub(",","",substring(weekly_price, 2))),
+         monthly_price= as.numeric(gsub(",","",substring(monthly_price, 2))),
+         cleaning_fee= as.numeric(gsub(",","",substring(cleaning_fee, 2))),
+         extra_people= as.numeric(gsub(",","",substring(extra_people, 2))),
+         security_deposit= as.numeric(gsub(",","",substring(security_deposit, 2)))) %>%
+  filter(!price==0) %>%
+  mutate(host_response_rate=as.numeric(sub("%","",host_response_rate)),
+         host_acceptance_rate=as.numeric(sub("%","",host_acceptance_rate)))
+
+
+#Check vars with missing values
+
+contains.missng <- listings.clust %>%
+  filter_all(any_vars(is.na(.))) %>%
+  select_if(function(x) any(is.na(x)))
+
+view(contains.missng)
+
+aggr_plot <- aggr(contains.missng,bars=FALSE, numbers=FALSE, sortVars=TRUE, labels=names(contains.missng), cex.axis=.6, gap=.1, ylab=c("Histogram of missing data",""))
+
+
+#Imputation numeric variables
+listings.clust <- listings.clust %>%
+  mutate(bathrooms=ifelse(is.na(bathrooms),median(bathrooms,na.rm=TRUE),bathrooms),
+         host_response_rate=ifelse(is.na(host_response_rate),median(host_response_rate,,na.rm=TRUE),host_response_rate),
+         host_acceptance_rate=ifelse(is.na(host_acceptance_rate),median(host_acceptance_rate,,na.rm=TRUE),host_acceptance_rate),
+         bedrooms=ifelse(is.na(bedrooms),median(bedrooms,,na.rm=TRUE),bedrooms),
+         beds=ifelse(is.na(beds),median(beds,,na.rm=TRUE),beds),
+         review_scores_rating=ifelse(is.na(review_scores_rating),median(review_scores_rating,,na.rm=TRUE),review_scores_rating),
+         cleaning_fee=ifelse(is.na(cleaning_fee),0,cleaning_fee),
+         extra_people=ifelse(is.na(extra_people),0,extra_people),
+         security_deposit=ifelse(is.na(security_deposit),0,security_deposit))
+
+#Imputation character variables
+
+listings.clust <- listings.clust %>%
+  mutate(host_is_superhost=ifelse(is.na(host_is_superhost),"undefined",host_is_superhost))
+
+#Creating new independent variables
+
+listings.clust <- listings.clust %>%
+  mutate(guests_included=ifelse(guests_included > accommodates,accommodates,guests_included),
+         net_price=(price+cleaning_fee)/guests_included,
+         weekly_discount=ifelse(is.na(weekly_price),0,1- (weekly_price/(price*7))),
+         monthly_discount=ifelse(is.na(monthly_price),0,1- (monthly_price/(price*30))),
+         num_amenities=sapply(strsplit(as.character(amenities),","),length),
+         privacy=ifelse(bedrooms >0,beds / bedrooms,0),
+         professional_host=ifelse(calculated_host_listings_count >2,"t","f")
+         )
+
+listings.clust <- listings.clust %>%
+  filter(!weekly_discount < 0) %>%
+  filter(!monthly_discount < 0) 
+#Calulate distance from city center
+
+coords <- listings.clust[,c("longitude","latitude")]
+listings.clust[,"distance"] <- pointDistance(coords,c(-73.9665,40.7812),lonlat=TRUE)
+
+#Cleaning fee to Binary Var (T/F)
+listings.clust <- listings.clust %>%
+  mutate(cleaning_fee.g=ifelse(cleaning_fee > 0,"t","f"))
+
+#Dropping orginal amenities variable
+
+listings.clust = dplyr::select(listings.clust,-c(amenities))
+
+
+#The popular one is chosen for clustering
+
+listings.clust <- listings.clust %>%
+    filter(number_of_reviews > 5) 
+
+
+glimpse(listings.clust)
+```
+
+
+```{r}
+#Remove column that not used for clustering
+clustering_data <- subset(listings.clust,select=-c(id,price,guests_included,weekly_price,monthly_price,cleaning_fee,calculated_host_listings_count))
+
+unique(clustering_data$host_has_profile_pic)
+
+#Data transformation: numeric to categories
+
+clustering_data <- clustering_data %>%
+  mutate(accommodates=ifelse(accommodates==1,"single",
+                             ifelse(accommodates==2,"couple","group")),
+         minimum_nights=ifelse(minimum_nights < 7, "short stay","long stay"),
+         security_deposit=ifelse(security_deposit>0,"t","f"))
+
+names(clustering_data)
+sapply(clustering_data, class)
+
+glimpse(clustering_data)
+
+#Scale data
+clustering_data_norm = mutate(clustering_data,
+                              baths = scale(bathrooms),
+                              host_response_rt=scale(host_response_rate),
+                              host_acceptance_rt=scale(host_acceptance_rate),
+                              reviews_count=scale(number_of_reviews),
+                              review_rating=scale(review_scores_rating),
+                              bedroom_count=scale(bedrooms),
+                              bed_count=scale(beds),
+                              amenity_count=scale(num_amenities),
+                              private=scale(privacy),
+                              distance=scale(distance),
+                              net_price=scale(net_price),
+                              extra_people=scale(extra_people),
+                              weekly_discount=scale(weekly_discount),
+                              monthly_discount=scale(monthly_discount),
+                              availability_365=scale(availability_365))
+
+clustering_data_norm1=dplyr::select(clustering_data_norm,-c(bathrooms,host_response_rate,host_acceptance_rate,number_of_reviews,review_scores_rating,bedrooms,beds,num_amenities,privacy,longitude,latitude))
+
+clustering_data_norm2 <- clustering_data_norm1 %>%
+  cbind(acm.disjonctif(clustering_data_norm1[,c("property_type","room_type","bed_type","cancellation_policy","instant_bookable","neighbourhood_group_cleansed","host_is_superhost","security_deposit","minimum_nights","accommodates","require_guest_profile_picture","require_guest_phone_verification","cleaning_fee.g","professional_host"
+                                                )])) %>% ungroup()
+
+#Remove the orginal (non-dummy-coded) varivables
+clustering_data_norm3 <- clustering_data_norm2 %>%
+  dplyr::select(-property_type,-room_type,-bed_type,-cancellation_policy,-instant_bookable,-host_is_superhost,-neighbourhood_group_cleansed,-security_deposit,-minimum_nights,-accommodates,-require_guest_phone_verification,-require_guest_profile_picture,-cleaning_fee.g,-professional_host)
+
+names(clustering_data_norm3)
+
+
+
+#Remove one of dummy variablies
+unique(listings.clust$host_has_profile_pic)
+unique(listings.clust$host_identity_verified)
+
+clustering_data_norm3 <- clustering_data_norm3 %>%
+  dplyr::select(-c("property_type.Aparthotel","room_type.Private room","bed_type.Couch","cancellation_policy.flexible","instant_bookable.f","host_is_superhost.t","neighbourhood_group_cleansed.Bronx","security_deposit.f" ,"minimum_nights.long stay","accommodates.couple","require_guest_profile_picture.f","require_guest_phone_verification.f","cleaning_fee.g.f","professional_host.f"
+                   ))
+
+names(clustering_data_norm3)
+
+```
+
+```{r}
+library(ggridges)
+ggplot(clustering_data, aes(x = num_amenities, y = cancellation_policy)) +
+  geom_density_ridges(aes(fill = cancellation_policy)) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07"))+
+  xlab("")+
+  ylab("")+
+  theme(legend.position="bottom")+
+  theme(panel.background = element_blank())+
+  theme(axis.line = element_line(colour = "black"))+
+  xlim(0,50)
+
+ggplot(clustering_data, aes(x = distance, y = cancellation_policy)) +
+  geom_density_ridges(aes(fill = cancellation_policy)) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07"))+
+  xlab("")+
+  ylab("")+
+  theme(legend.position="bottom")+
+  theme(panel.background = element_blank())+
+  theme(axis.line = element_line(colour = "black"))
+
+ggplot(clustering_data, aes(x = number_of_reviews, y = cancellation_policy)) +
+  geom_density_ridges(aes(fill = cancellation_policy)) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07"))+
+  xlab("")+
+  ylab("")+
+  theme(legend.position="bottom")+
+  theme(panel.background = element_blank())+
+  theme(axis.line = element_line(colour = "black"))+
+  xlim(0,100)
+```
+
+```{r}
+#PCA to reduce dimension and remove outliners before clustering
+pca_spotify <- PCA(clustering_data_norm3, 
+                scale.unit = FALSE,
+                graph = F, 
+                ncp =20) #default: 5)
+summary(pca_spotify)
+
+capture.output(summary(pca_spotify), file = "pca.txt")
+
+plot.PCA(pca_spotify,axes = c(1, 2))
+plot.PCA(pca_spotify,axes = c(1, 2)) + xlim(10,40)
+
+plot.PCA(pca_spotify, choix = c("var"))
+
+pca_spotify$svd[1:15]
+
+# Create an intermediate data frame with pca_1 and pca_2
+spotify_new <- pca_spotify$ind$coord[ ,1:15]
+
+spotify_new1 <- spotify_new[-c(5510,6511,7776,1715),]
+
+
+```
+
+
+
+```{r}
+##AIRBNB CLISTING CLUSTER
+memory.limit(size=5000000) 
+elbow_method <- fviz_nbclust(spotify_new1,kmeans,method="wss")
+
+elbow_method                                                                                                 
+
+#Run the clustering
+set.seed(2)
+kcluster <- kmeans(spotify_new1,centers=4,iter.max=30,nstart=25)
+kcluster$size
+
+kcluster$centers
+
+clustering_data <-clustering_data[-c(5510,6511,7776,1715),] %>%
+  mutate(segment=kcluster$cluster)%>%
+  mutate(segment=as.factor(segment))
+
+unique(clustering_data$host_is_superhost)
+
+product.clust <- clustering_data %>%
+  filter(!net_price >1000) %>% #too extreme products
+  group_by(segment) %>%
+  summarize_if(is.numeric,mean)
+
+# View the resulting table
+product.clust 
+
+
+```
+
+```{r}
+
+#VISUALIZATION
+#Pricing Policy 
+x1 <- clustering_data %>%
+  ggplot(aes(x = segment, y = net_price,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+x2 <- clustering_data %>%
+  filter(monthly_discount >0 ) %>%
+  ggplot(aes(x = segment, y = monthly_discount,fill=segment)) +
+  geom_violin() +
+  scale_y_log10()
+
+x3 <- clustering_data %>%
+  filter(weekly_discount >0) %>%
+  ggplot(aes(x = segment, y = weekly_discount,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+x4 <- clustering_data %>%
+  ggplot(aes(x = segment, y = extra_people,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+
+library(ggpubr)
+x <- ggarrange(x1, x2, x3,x4,
+                    labels = c("Net Price", "Monthly Discount", "Weekly Discount","Extra People Charge"),
+                    common.legend = TRUE,legend = "bottom",
+                    ncol = 2, nrow = 2)
+ggexport(x, filename = "x.png")
+
+#Housing Charateristics
+y1 <- clustering_data %>%
+  ggplot(aes(x = segment, y = bathrooms,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+y2 <- clustering_data %>%
+  filter(monthly_discount >0 ) %>%
+  ggplot(aes(x = segment, y = bedrooms,fill=segment)) +
+  geom_violin() +
+  scale_y_log10()
+
+y3 <- clustering_data %>%
+  filter(weekly_discount >0) %>%
+  ggplot(aes(x = segment, y = beds,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+y4 <- clustering_data %>%
+  ggplot(aes(x = segment, y = num_amenities,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+y5 <- clustering_data %>%
+  ggplot(aes(x = segment, y = privacy,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+y <- ggarrange(y1, y2, y3,y4,y5,
+                    labels = c("Bathrooms", "Bedrooms", "Beds","Amenities","Privacy"),
+                    common.legend = TRUE,legend = "bottom",
+                    ncol = 3, nrow = 2)
+ggexport(y, filename = "y.png")
+
+#Location
+clustering_data %>%
+  ggplot(aes(x = segment, y = distance,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()+
+  ggtitle("Distance")+
+  theme(legend.position="bottom")
+
+#Host Background
+
+z1 <- clustering_data %>%
+  ggplot(aes(x = segment, y = host_response_rate,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+z2 <- clustering_data %>%
+  ggplot(aes(x = segment, y = host_acceptance_rate,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+z <- ggarrange(z1, z2,
+                    labels = c("Host Response", "Host Acceptance"),
+                    common.legend = TRUE,legend = "bottom",
+                    ncol = 1, nrow = 2)
+ggexport(z, filename = "z.png")
+
+z
+
+#Review Ratings
+t1 <- clustering_data %>%
+  ggplot(aes(x = segment, y = number_of_reviews,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+t2 <- clustering_data %>%
+  ggplot(aes(x = segment, y = review_scores_rating,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()
+
+t <- ggarrange(t1, t2,
+                    labels = c("Reviews", "Rating"),
+                    common.legend = TRUE,legend = "bottom",
+                    ncol = 1, nrow = 2)
+ggexport(t, filename = "t.png")
+
+#Historical Availability
+clustering_data %>%
+  ggplot(aes(x = segment, y = availability_365,fill=segment)) +
+    geom_violin() +
+    scale_y_log10()+
+  ggtitle("Availability")+
+  theme(legend.position="bottom")
+
+
+
+####Categorical Variables 
+##Accomodations
+
+Acco.Per <- clustering_data %>% group_by(segment) %>% count(accommodates) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Acco.Per,aes(x=factor(segment),y=ratio,fill=accommodates))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Acco.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "")+
+  ggtitle("Accommodations")
+
+
+#Pricing Policy
+
+
+Deposit.Per <- clustering_data %>% group_by(segment) %>% count(security_deposit) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Deposit.Per,aes(x=factor(segment),y=ratio,fill=security_deposit))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Deposit.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  ggtitle("Security Deposit")
+
+Cleaning.Per <- clustering_data %>% group_by(segment) %>% count(cleaning_fee.g) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Cleaning.Per,aes(x=factor(segment),y=ratio,fill=cleaning_fee.g))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Cleaning.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  theme(legend.position="bottom")+
+  ggtitle("Cleaning Fee")
+
+
+#Host Background
+Host.Per <- clustering_data %>% group_by(segment) %>% count(host_is_superhost) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Host.Per,aes(x=factor(segment),y=ratio,fill=host_is_superhost))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Host.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "", labels = c("True", "False","Undefined"))+
+  ggtitle("Host is Superhost")
+
+
+
+Host.Prof.Per <- clustering_data %>% group_by(segment) %>% count(professional_host) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Host.Prof.Per,aes(x=factor(segment),y=ratio,fill=professional_host))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Host.Prof.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  theme(legend.position="bottom")+
+  ggtitle("Host is Professional Host")
+
+
+
+#Booking Policy
+Cancellation.Per <- clustering_data %>% group_by(segment) %>% count(cancellation_policy) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Cancellation.Per,aes(x=factor(segment),y=ratio,fill=cancellation_policy))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Cancellation.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "")+
+  ggtitle("Cancellation Policy")
+
+
+Instant.Per <- clustering_data %>% group_by(segment) %>% count(instant_bookable) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Instant.Per,aes(x=factor(segment),y=ratio,fill=instant_bookable))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Instant.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  ggtitle("Instant Bookable")
+
+Minimum.Per <- clustering_data %>% group_by(segment) %>% count(minimum_nights) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Minimum.Per,aes(x=factor(segment),y=ratio,fill=minimum_nights))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Minimum.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "")+
+  ggtitle("Minimum Nights")
+
+#Guest Background
+
+Guest.Profile.Per <- clustering_data %>% group_by(segment) %>% count(require_guest_profile_picture) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Guest.Profile.Per,aes(x=factor(segment),y=ratio,fill=require_guest_profile_picture))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Guest.Profile.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  ggtitle("Require Guest Profile Picture")
+
+Guest.Phone.Per <- clustering_data %>% group_by(segment) %>% count(require_guest_phone_verification) %>% 
+  mutate(ratio=round(n*100/sum(n),0))
+
+ggplot(Guest.Phone.Per,aes(x=factor(segment),y=ratio,fill=require_guest_phone_verification))+
+    geom_bar(position="fill",color="black",stat = "identity")+
+    geom_text(data=Guest.Phone.Per, aes(y=n,label=paste0(ratio,"%")),position=position_fill(vjust=0.5))+
+  scale_y_continuous(labels = scales::percent)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(face="bold",size=9))+
+  theme(legend.position="bottom")+
+  scale_fill_discrete(name = "", labels = c("True", "False"))+
+  ggtitle("Require Guest Phone Verification")
+
+
+
+```
+
+```{r}
+###DYNAMIC PRCING ANALYSIS
+
+
+listings.segment <- listings.clust[-c(5510,6511,7776,1715),] %>%
+  mutate(segment=kcluster$cluster)%>%
+  dplyr::select(id,segment,cleaning_fee,guests_included)
+
+names(listings.segment)
+
+calendar.list <- calendar %>%
+  inner_join(listings.segment,by=c("listing_id"="id"))%>%
+  mutate(date=as.Date(date)) %>%
+  dplyr::select(listing_id,date,available,price,adjusted_price,segment,cleaning_fee,guests_included) %>%
+  mutate(adjusted_price= as.numeric(gsub(",","",substring(adjusted_price, 2))))%>%
+  mutate(net_adjusted_price=(adjusted_price+cleaning_fee)/guests_included)
+
+calendar.list.sum <- calendar.list %>%
+  dplyr::select(listing_id,date,net_adjusted_price,segment)
+
+
+calendar.list$day <- weekdays(as.Date(calendar.list$date))
+calendar.list$month <- months(as.Date(calendar.list$date))
+calendar.list$year <- years(as.Date(calendar.list$date))
+
+#Holiday
+
+holiday <- holiday %>%
+  mutate(date=as.Date(Date))
+
+n_distinct(calendar.list$listing_id)
+
+calendar.list.new1 <- calendar.list %>%
+  left_join(holiday,by=c("date"="date"))%>%
+  left_join(review.count,by=c("listing_id","date")) %>%
+  mutate(holiday=ifelse(Date==date,"holiday",NA)) %>%
+  mutate(holiday=ifelse(is.na(holiday),"no_holiday",holiday))
+
+
+day_levels <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+
+month_levels <- c("January","February","March","April","May","June","July","August","September","October","November","December")
+
+holiday_levels <- c("no_holiday","holiday")
+
+calendar.list.reg <- calendar.list.new1 %>%
+  dplyr::select(listing_id,segment,net_adjusted_price,cleaning_fee,day,month,holiday,month,year)%>%
+  mutate(segment=as.factor(segment),
+         day=factor(day,levels=day_levels),
+         month=factor(month,levels=month_levels),
+         holiday=factor(holiday,levels=holiday_levels),
+         year=as.factor(year),
+         listing_id=as.factor(listing_id))%>%
+  filter(!year==2021)
+
+
+
+
+###Price regression
+check <-lm(log(net_adjusted_price) ~ . + segment*day + segment*month + segment*holiday + segment*year -listing_id, data = calendar.list.reg)
+
+summary(check)
+
+```
+
+```{r}
+calendar.list.reg %>%
+  filter(!year==2021) %>%
+  filter(!is.na(net_adjusted_price)) %>%
+  filter(net_adjusted_price <500) %>%
+  group_by(segment,year,month)%>%
+  summarise(mean=mean(net_adjusted_price))%>%
+  ggplot(aes(x=month,y=mean,group=segment,color=segment))+
+  geom_line()+
+  facet_wrap(~year)+
+  theme(axis.text.x = element_text(angle = 90))+
+  ylab("")+
+  xlab("")+
+  ggtitle("Mean Price of each Product Cluster in the period of 2019-2020")
+
+calendar.list.new1 %>%
+  dplyr::select(listing_id,segment,net_adjusted_price,month,year,n)%>%
+  mutate(segment=as.factor(segment),
+         month=factor(month,levels=month_levels),
+         year=as.factor(year)) %>%
+  filter(!year==2021)%>%
+  mutate(n=ifelse(is.na(n),0,n))%>%
+  group_by(segment,year,month)%>%
+  summarise(n=sum(n),
+            count=n_distinct(listing_id)) %>%
+  mutate(review_per_listing=n/count)%>%
+  ggplot(aes(x=month,y=count,group=segment,color=segment))+
+  geom_line()+
+  facet_wrap(~year)+
+  theme(axis.text.x = element_text(angle = 90))+
+  ylab("")+
+  xlab("")+
+  ggtitle("Reviews per Listing of each Product Cluster in the period of 2019-2020")
+
+
+
+```
+
+
+```{r}
+#Price fluctuation
+calendar.list.new2 <- calendar.list.new1 %>% 
+  filter(!is.na(net_adjusted_price)) %>%
+  group_by(listing_id, segment) %>% 
+  mutate(change = lag(net_adjusted_price, default = first(net_adjusted_price)) != net_adjusted_price) %>% 
+  group_by(listing_id, segment) %>% 
+  summarise(modified = sum(change, na.rm = TRUE),
+            unmodified = sum(!change, na.rm = TRUE)) %>% 
+  mutate(total = modified + unmodified)%>%
+  mutate(days_fluc=modified*100/total)
+
+                                
+calendar.list.new2 %>%
+  mutate(days_block=ifelse(days_fluc==0,"No dynamic prcing",
+                           ifelse(days_fluc < 5,"0-5%",
+                                  ifelse(days_fluc <10, "5-10%",
+                                         ifelse(days_fluc <25,"10-25%","25% or more")))))%>%
+  group_by(segment,days_block)%>%
+  count(segment,days_block)%>%
+  spread(days_block,n)
+
+
+```
+
+
+
+

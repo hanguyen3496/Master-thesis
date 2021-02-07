@@ -1,0 +1,597 @@
+---
+title: "Topic Modelling"
+output: html_document
+---
+
+```{r}
+library(spacyr)
+library(tidyverse)
+library(quanteda)
+require(seededlda)
+library(udpipe)
+require(quanteda.textmodels)
+library("textcat")
+library("tm")
+library(SnowballC)
+library(topicmodels)
+library(slam)
+library(tidytext)
+library(syuzhet)
+library(factoextra)
+library(RColorBrewer)
+library(wordcloud)
+library(ggrepel)
+library(syuzhet)
+
+sets <- data(package = "genderdata")$results[,"Item"]
+data(list = sets, package = "genderdata")
+name_stopwords <- as.vector(kantrowitz$name)
+name_stopwords <- c(name_stopwords,"zuleyka")
+
+```
+
+
+```{r}
+
+getwd
+
+setwd("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Airbnb Data")
+listings <- read.csv("listings.csv.gz")
+reviews <- read.csv("reviews.csv.gz",encoding="UTF-8")
+reviews <- reviews[which(!grepl("[^\x01-\x7F]+", reviews$comments)),] #remove non abc alphabet
+
+#### Target group of local hotels: private/shared -> take only listings id that 
+listings.rev <- listings %>%
+  filter(!room_type == "Entire home/apt" ) %>%
+  dplyr::select(id,room_type,price,cleaning_fee,guests_included,extra_people,security_deposit,cancellation_policy,instant_bookable,is_business_travel_ready,accommodates, minimum_nights) %>%
+  mutate(price= as.numeric(gsub(",","",substring(price, 2))),
+         cleaning_fee= as.numeric(gsub(",","",substring(cleaning_fee, 2))),
+         extra_people= as.numeric(gsub(",","",substring(extra_people, 2))),
+         security_deposit= as.numeric(gsub(",","",substring(security_deposit, 2))))%>%
+  replace(is.na(.),0)%>%
+  mutate(guests_included=ifelse(guests_included > accommodates,accommodates,guests_included),
+         net_price=(price+cleaning_fee)/guests_included)
+  
+
+colnames(listings.rev)[1] <- "listing_id"
+
+
+
+reviews <- reviews %>%
+  mutate(date=as.Date(date)) %>%
+  inner_join(listings.rev,by="listing_id") %>%
+  filter(date > "2020-01-01") %>%
+  filter(str_count(comments,"\\W+") > 5) %>%
+  filter(!str_detect(comments, pattern = "The host canceled this reservation")) %>%
+  filter(!str_detect(comments, pattern = "The reservation was canceled")) %>%
+  filter(!str_detect(comments, pattern = "The host canceled my reservation"))
+
+
+
+reviews.check <- reviews %>%
+  dplyr::select(id,comments)
+
+colnames(reviews.check) <- c("doc_id", "text")
+
+
+```
+
+
+```{r}
+####Create data source
+
+reviews.check1 <- reviews.check %>%
+  mutate(language=textcat(text))%>%
+  filter(language =="english") %>%
+  dplyr::select(!language)
+
+#Spit reviews into sentences and remove non-meaning sentences
+reviews.check.sen <- unnest_tokens(reviews.check1,output=text,input=text,token="sentences",to_lower = FALSE) %>%
+  mutate(text = paste(tolower(substr(text, 1, 1)), substr(text, 2, nchar(text)), sep="")) 
+
+reviews.check.sen <- reviews.check.sen%>%
+  mutate(text = str_remove_all(reviews.check.sen$text,"[A-Z][a-z]+(?:'s)?")) %>%
+  filter(str_count(text,"\\W+") > 2)  %>%
+  mutate(sentence_id=as.character(row_number()))
+
+
+```
+
+
+```{r}
+#####Text pre-processing 
+
+reviews.corpus <- VCorpus(VectorSource(reviews.check.sen$text))
+
+#transaformation of the corpora
+reviews.corpus.clean <- tm_map(reviews.corpus, content_transformer(tolower)) 
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeWords, stopwords("en"))
+
+
+###Remove host name, but thís step only remove some names
+chunk <- 500
+n <- length(name_stopwords)
+r <- rep(1:ceiling(n/chunk),each=chunk)[1:n]
+d <- split(name_stopwords,r)
+
+for (i in 1:length(d)) {
+  myCorpus <- tm_map(reviews.corpus.clean, removeWords, c(paste(d[[i]])))
+}
+
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, stripWhitespace)
+
+#Remove punctuation but still keep space between 
+replacePunctuation <- content_transformer(function(x) {return (gsub("[[:punct:]]"," ", x))})
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, replacePunctuation)
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeWords, as.character(tidytext::stop_words)) # remove stopword again after punctuation removal
+
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, removeNumbers)
+reviews.corpus.clean <- tm_map(reviews.corpus.clean, PlainTextDocument,lazy=TRUE)
+
+
+```
+
+
+
+```{r}
+###TOG with udpipe
+
+corp_quanteda <- corpus(reviews.corpus.clean, textField = "text")
+
+ud_model <- udpipe_download_model(language = "english")
+ud_model <- udpipe_load_model(ud_model$file_model)
+x <- udpipe_annotate(ud_model, x = texts(corp_quanteda), doc_id = docnames(corp_quanteda), parser = "none")
+x <- as.data.frame(x)
+
+
+```
+
+
+```{r}
+#Topic modelling with unsupervised LDA
+
+###Remove stopwords
+
+custom.stopword <- c("apts","people","person","lot","lots","effort","fault", "newyork","new york","space","home","airbnb","cancel","min","unit","bit","week","weekend","brooklyn","manhattan","nyc","ny","york","city"        ,"house","day","night","minute","block","stay","women","friend","boyfriend","girlfriend","bf","gf","new yorker","dog","cat","baby","student","male","female","air","bnb","lga","nice","host"
+)
+               
+
+colnames(x)[7] <- "word"
+
+stop_words <- tidytext::stop_words %>%
+  filter(!word %in% c("value"))
+
+x1 <- subset(x, upos %in% c('NOUN',"VERB","ADJ")) %>%
+  dplyr::select(doc_id,sentence,word) %>%
+  filter(!word %in% custom.stopword) %>%
+  filter(!word %in% name_stopwords) %>% #remove the remaining hots names
+  anti_join(stop_words) 
+
+x1 <- x1 %>%
+  group_by(doc_id,sentence) %>% summarise(word = paste(word, collapse = " "))%>%
+  mutate(doc_id=as.numeric(substring(doc_id, 5))) %>%
+  arrange(-desc(doc_id))
+
+y1 <- x1 %>% #Break sentence into words token
+  unnest_tokens(input=word,output=word,token = "words")
+
+#Create DTM
+y1_dtm <- y1 %>%
+  # get count of each token in each document
+  count(doc_id, word) %>%
+  # create a document-term matrix with all features and tf weighting
+  cast_dtm(document = doc_id, term = word, value = n)
+
+
+#removeCommonTerms function
+
+removeCommonTerms <- function (x, pct) 
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")), 
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix")) 
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix")) 
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+y1_dtm <- removeCommonTerms(y1_dtm ,.3)
+
+### Remove the sparse reviews
+y1_dtm <- removeSparseTerms(y1_dtm, 0.999)
+#review.id <- review.dtm$id[row_sums(review.dtm) > 0]
+y1_dtm <- y1_dtm[row_sums(y1_dtm) > 0,]
+
+#####Topic modellings
+mod_log_lik = numeric(9)
+mod_perplexity = numeric(9)
+
+for (i in 2:10) { mod = LDA(y1_dtm, k=i, method="Gibbs",             
+                            control=list(alpha=0.5, iter=10, seed=12345, thin=1))
+                  mod_log_lik[i] = logLik(mod)  
+                  mod_perplexity[i] = perplexity(mod, y1_dtm)}
+
+# Specify the possible values of k and build the plot
+k <- 2:10
+plot(x=k, y=mod_perplexity[2:10], xlab="number of clusters, k", 
+     ylab="perplexity score", type="o")
+plot(x=k, y=mod_log_lik[2:10], xlab="number of clusters, k", 
+     ylab="log-likelihood score", type="o")
+
+#### How many topics?
+lda_mod <- LDA(x=y1_dtm, k=5, method="Gibbs",
+               control=list(alpha=0.5, iter=100, seed=12345, thin=1))
+
+tidy(lda_mod,matrix="beta")%>%
+  group_by(topic)
+
+# get keywords of each LDA topic
+lda_keywords <- data.frame(topicmodels::terms(lda_mod, 60), stringsAsFactors = FALSE)
+lda_keywords
+
+
+
+```
+
+
+
+```{r}
+
+#Topic modelling with seeded words (based on unsupervised LDA)
+
+
+x2 <- corpus(x1,docid_field = "doc_id",text_field = "word",unique_docnames = TRUE)
+
+
+dfmt <- dfm(x2) %>%
+  dfm_trim(min_termfreq = 0.90, termfreq_type = "quantile", 
+             max_docfreq = 0.20, docfreq_type = "prop")
+
+dict <- dictionary(list(value = c("price","value","cheap","quality","money","worth","expect","spend","affordable","reasonable","unreasonable","recommend","deal","save","rate","offer","promote","coupon","discount","expensive","inexpensive","charge","cost","budget"),
+                        location = c("location","distance","close","access","walking","parking","transportation","subway","highway","station","metro","close"),
+                        communication=c("host","respond","helpful","responsive","unresponsive","friendly","communication","communicate","communicative","question","hospitality","contact","problem","phone","detail"),
+                        product_service=c("room","arrival","check","bed","bathroom","kitchen","shower","amenity","apartment","tv","towel","window","coffee","service","information","check","breakfast","coffee","process","luggage","smooth","care","detail","accurate"),
+                        experience=c("stay", "experience", "neighbor", "service", "view", "hospitality", "future", "overall",
+"environment", "care" )))
+
+
+set.seed(1234)
+slda <- textmodel_seededlda(dfmt,alpha=0.5,dictionary=dict, residual = FALSE)
+
+?textmodel_seededlda
+print(slda)
+
+#' Extract most likely terms
+#' @param x a fitted LDA model
+#' @param n number of terms to be extracted
+#' @export
+terms <- function(x, n = 10) {
+    UseMethod("terms")
+}
+#' @export
+#' @method terms textmodel_lda
+#' @importFrom utils head
+terms.textmodel_lda <- function(x, n = 10) {
+    apply(x$phi, 1, function(x, y, z) head(y[order(x, decreasing = TRUE), drop = FALSE], z),
+          colnames(x$phi), n)
+}
+
+#' Extract most likely topics
+#' @export
+#' @param x a fitted LDA model
+topics <- function(x) {
+    UseMethod("topics")
+}
+#' @export
+#' @method topics textmodel_lda
+topics.textmodel_lda <- function(x) {
+    colnames(x$theta)[max.col(x$theta)]
+}
+
+
+
+```
+
+
+
+```{r}
+###Define the dominent topics for each sentences 
+###Append topics to each sentence
+x1$topic <- topics(slda)
+
+colnames(x1)[1] <- "sentence_id"
+x1$sentence_id <- as.character(x1$sentence_id)
+
+reviews.topic <- x1 %>%
+  inner_join(reviews.check.sen,by="sentence_id")%>%
+  dplyr::select(!c("sentence","word"))
+
+write.csv(reviews.topic,"reviews.topic.csv")## File used for sentiment analysis later
+
+```
+
+```{r}
+
+#Define topics weights for each reviews: Aspects Weights
+y <- as.data.frame(terms(slda,150)) #total words in each topic,but there are still some words overlap -> eliminate it out 
+
+value <- y[1]
+colnames(value)[1] <- "word"
+
+location <- y[2]
+colnames(location)[1] <- "word"
+
+communication <- y[3]
+colnames(communication)[1] <- "word"
+
+product_service <- y[4]
+colnames(product_service)[1] <- "word"
+
+experience <- y[5]
+colnames(experience)[1] <- "word"
+
+
+
+condition <- y1$word %in% unlist(value)
+y1$value[condition] <- "1"
+
+condition <- y1$word %in% unlist(location)
+y1$location[condition] <- "1"
+ 
+condition <- y1$word %in% unlist(communication)
+y1$communication[condition] <- "1"
+
+condition <- y1$word %in% unlist(product_service)
+y1$product_service[condition] <- "1"
+
+condition <- y1$word %in% unlist(experience)
+y1$experience[condition] <- "1"
+
+colnames(y1)[1] <- "sentence_id"
+
+y1$sentence_id <- as.character(y1$sentence_id)
+
+reviews.check.sen2 <- reviews.check.sen %>%
+  left_join(y1) %>%
+  dplyr::select(!c(sentence)) %>%
+  mutate(value = as.numeric(ifelse(is.na(value), 0, value)),
+         location = as.numeric(ifelse(is.na(location), 0, location)),
+         communication = as.numeric(ifelse(is.na(communication), 0, communication)),
+         product_service = as.numeric(ifelse(is.na(product_service), 0, product_service)),
+         experience = as.numeric(ifelse(is.na(experience), 0, experience)))%>%
+  group_by(doc_id) %>%
+  summarise_if(is.numeric,sum)
+
+reviews.check.sen3 <- reviews.check.sen2[!(apply(reviews.check.sen2, 1, function(y) any(y == 0))),] %>% #take reviews that has all 5 aspects
+  gather("topic","word",-doc_id)%>%
+  group_by(doc_id) %>%
+  mutate(ED=word/sum(word)) 
+  
+
+
+###Total aspects sentence
+topic <- as.data.frame(table(topics(slda))) %>%
+  mutate(topic=as.character(Var1)) %>%
+  mutate(EC=log(1/(Freq/sum(Freq)))) %>%
+  dplyr::select(topic,EC)
+
+reviews.check.sen3 <- reviews.check.sen3 %>%
+  left_join(topic) %>%
+  mutate(ED_EC=ED*EC) %>%
+  group_by(doc_id) %>%
+  mutate(weight=ED_EC/sum(ED_EC)) %>%
+  dplyr::select(doc_id,topic,weight) %>%
+  spread(topic,weight) %>%
+  ungroup()
+  
+reviews.check.sen3 <- reviews.check.sen3 %>%
+  inner_join(reviews,by=c("doc_id" = "id")) %>% #inner_join: has reviews- no listings
+  mutate(doc_id=as.character(doc_id))%>%
+  filter(!net_price==0)
+  
+
+###Explore customer segmentation based on aspect weights: 3 customer groups
+
+reviews.check.sen3 %>% 
+  summarize_if(is.numeric,mean)
+
+#Price normalization to scake [0,1]
+normalize <- function(x) {
+  return((x-min(x))/((max(x)-min(x))))
+}
+
+
+
+reviews.check.sen3.clust <- reviews.check.sen3 %>%
+  dplyr::select(communication,experience,value,location,product_service,net_price) %>%
+  mutate(net_price=log(net_price))
+
+reviews.check.sen3.clust.scl <- reviews.check.sen3.clust %>%
+  mutate(net_price=normalize(net_price))
+
+
+ebow_method <- fviz_nbclust(reviews.check.sen3.clust.scl,kmeans,method="wss")
+
+# View the plot
+ebow_method
+
+# Run the k-means algorithm 
+set.seed(3496)
+k_means <- kmeans(reviews.check.sen3.clust.scl,centers=3,iter.max=30,nstart=25)
+
+reviews.check.sen3.labeled <- reviews.check.sen3 %>%
+  mutate(clusters = k_means$cluster)
+
+review.seg <- reviews.check.sen3.labeled %>%
+  group_by(clusters) %>%
+  summarize_if(is.numeric,mean) #customer profiling based on review behavior
+
+
+#Further profiling based on sentiment 
+syuzhet_vector <- get_sentiment(unlist(reviews.check.sen3.labeled$comments), method="syuzhet")
+
+reviews.check.sen3.labeled[,"sentiment"] <- syuzhet_vector
+
+review.seg.sen <- reviews.check.sen3.labeled %>%
+  mutate(sentiment_group=ifelse(sentiment > 0, "positive",
+                                ifelse(sentiment < 0 , "negative", "neutral"))) %>%
+  group_by(clusters,sentiment_group) %>%
+  summarize_if(is.numeric,mean) %>%
+  filter(!sentiment_group=="neutral")
+
+
+```
+
+
+```{r}
+
+##SENTIMENT ANALYSIS 
+word_clouds <- y1 %>%
+  # get count of each token in each document
+  group_by(word) %>%
+  count(word)
+
+##Create Wordcloud
+
+set.seed(1234) # for reproducibility 
+wordcloud(words = word_clouds$word, freq = word_clouds$n, min.freq = 1, max.words=200, random.order=FALSE, rot.per=0.35,            colors=brewer.pal(8, "Dark2"))
+
+
+####Sentiment Analysis: General Sentiment
+
+reviews.topic <- read.csv("C:/Users/Ha Nguyen/Desktop/Thesis/Data/Airbnb Data/reviews.topic.csv")
+
+# Get sentiment scores
+
+syuzhet_vector <- get_sentiment(unlist(reviews.topic$text), method="syuzhet")
+
+as.data.frame(syuzhet_vector)%>%
+  mutate(sen=ifelse(syuzhet_vector>0,"positive",
+                    ifelse(syuzhet_vector<0,"negative","neutral")))%>%
+  group_by(sen)%>%
+  count(sen)%>%
+  ungroup() %>%
+  arrange(desc(-n)) %>%
+  
+# Basic piechart
+  ggplot(aes(x=sen, y=n, fill=sen)) + 
+  geom_bar(position = 'dodge', stat='identity') +
+  geom_text(aes(label=n), position=position_dodge(width=0.9), vjust=-0.25)+
+  scale_fill_brewer(palette="YlOrRd",direction=-1) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "General Reviews Sentiment Analysis")+
+  theme_classic() + theme(axis.line = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          plot.title = element_text(hjust = 0.5))+
+  theme(legend.position="bottom")
+
+##Sentiment Polarity per Tokenized Words
+
+word_vector <- get_sentiment(unlist(word_clouds$word), method="syuzhet")
+word_clouds[,"polarity"] <- word_vector
+
+
+ap_sentiments <- word_clouds %>%
+  mutate(sentiment=ifelse(polarity >0,"positive",
+                          ifelse(polarity < 0, "negative","neutral"))) %>%
+  filter(!sentiment=="neutral") %>%
+  group_by(sentiment)%>%
+  arrange(desc(n))%>%
+  top_n(20,n) %>%
+  mutate(n = ifelse(sentiment == "negative", -n, n)) %>%
+  mutate(term = reorder(word, n)) %>%
+  ggplot(aes(term, n, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Top 20 Words Contribution to Sentiment")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+
+ap_sentiments
+
+#Aspect based Sentiment Analysis
+
+result <-get_nrc_sentiment(unlist(reviews.topic$text))
+
+result[,c("doc_id","sentence_id","topic","text")] <- reviews.topic[,c("doc_id","sentence_id","topic","text")]
+result[,c("sentiment_score")] <- syuzhet_vector
+
+#Polarity sentiment in each aspect
+
+result %>%
+  mutate(polarity=ifelse(sentiment_score >0 ,"positive",
+                         ifelse(sentiment_score <0, "negative","neutral"))) %>%
+  filter(!polarity=="neutral")%>%
+  group_by(polarity,topic) %>%
+  count()%>%
+  mutate(n = ifelse(polarity == "negative", -n, n)) %>%
+  ggplot(aes(topic, n, fill = polarity)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Sentiment Polarity over Aspects")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+
+#Summary of 8 sentiments in each aspect
+result %>%
+  select(!c("positive","negative","doc_id","sentence_id","sentiment_score")) %>%
+  group_by(topic)%>%
+  summarise_if(is.numeric,sum) %>%
+  ungroup() %>%
+  gather("sentiment","value",-topic)%>%
+  group_by(topic) %>%
+  ggplot(aes(sentiment, value, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~topic) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Emotion Levels of the Lodging Aspects")+
+  theme(legend.position="bottom",
+         plot.title = element_text(hjust = 0.5))
+
+result1 <- result %>%
+  select(!c("positive","negative","doc_id","sentence_id","sentiment_score")) %>%
+  group_by(topic)%>%
+  summarise_if(is.numeric,sum) %>%
+  ungroup() %>%
+  gather("sentiment","value",-topic)%>%
+  group_by(topic) %>%
+  mutate(per=value*100/sum(value)) %>%
+  arrange(desc(topic)) %>%
+  select(!value) %>%
+  spread(sentiment,per)
+
+
+
+### Maps of all targeted reviews with clusters
+
+#Which area is more expensive?
+ggplot(price.data,aes(x = long , y = lat,group=group, fill=avg_price)) + geom_polygon(color="black") +
+  geom_polygon(data = nyc_boro,
+               aes(x=long, y=lat, group = group),color="black",fill = NA, size = 1.5) +
+  geom_text_repel(data = nc, aes(x = long, y = lat, label = boro_name), inherit.aes = FALSE,
+                  fontface = "bold", nudge_x = c(0.1, 0.1, -0.2, -0.2, 0.1), nudge_y = c(0.1 ,-0.2, 0.2, 0.1, -0.3)) +
+  ggtitle("Which area is the most expensive?",
+          subtitle = "Map showing Average Price by Area") +
+  theme(plot.title = element_text(face = "bold")) +
+  theme(plot.subtitle = element_text(face = "bold", color = "grey5")) +
+  theme(plot.caption = element_text(color = "grey68"))+ 
+  scale_fill_distiller("Average Price", type = "div", palette = "Spectral",values = scales::rescale((1:10)^2, c(0,1)),
+                       direction = 1, labels = scales::comma_format()) +
+  theme_classic()+
+  theme(plot.title = element_text(face = "bold")) +
+  theme(axis.title.y = element_blank()) + 
+  theme(axis.title.x = element_blank()) + 
+  theme(axis.line = element_blank()) + 
+  theme(axis.ticks = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  theme(axis.text.y = element_blank())
+  
+
+```
+
